@@ -1,11 +1,12 @@
-import os
-import json
-from agents import Agent
+from agents import Agent, Runner
 from openai import AsyncOpenAI
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from dotenv import load_dotenv
-from pydantic import BaseModel
-from typing import List
+import os
+
+from agents import set_tracing_disabled
+
+set_tracing_disabled(True)
 
 # 加载 .env 文件
 load_dotenv()
@@ -26,79 +27,17 @@ model = OpenAIChatCompletionsModel(
     openai_client=openai_client
 )
 
-# 加载 agent 配置（指令/提示词）
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'agent_config.json')
-with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-    agent_config = json.load(f)
-
-# 目标解析模块
-class GoalInterpreterOutput(BaseModel):
-    task: str
-    input: str
-    output: str
-    modules: List[str]
-    constraints: List[str]
-
-goal_interpreter_agent = Agent(
-    name="GoalInterpreterAgent",
-    instructions=agent_config["GoalInterpreterAgent"],
-    output_type=GoalInterpreterOutput,
+# 初始化 Agent
+agent = Agent(
+    name="DeepSeek助手",
+    instructions="你是一个乐于助人的中文助手。",
     model=model
 )
 
-# 任务拆解模块
-class SubTask(BaseModel):
-    module: str
-    sub_goal: str
-    dependencies: List[str]
+async def main():
+    result = await Runner.run(agent, input="用中文写一首关于春天的诗。")
+    print(result.final_output)
 
-class TaskPlannerOutput(BaseModel):
-    sub_tasks: List[SubTask]
-
-task_planner_agent = Agent(
-    name="TaskPlannerAgent",
-    instructions=agent_config["TaskPlannerAgent"],
-    output_type=TaskPlannerOutput,
-    model=model
-)
-
-# 代码生成模块
-code_writer_agent = Agent(
-    name="CodeWriterAgent",
-    instructions=agent_config["CodeWriterAgent"],
-    model=model
-)
-
-# 执行与测试模块
-executor_agent = Agent(
-    name="ExecutorAgent",
-    instructions=agent_config["ExecutorAgent"],
-    model=model
-)
-
-# 错误分析模块
-class ErrorAnalyzerOutput(BaseModel):
-    error_type: str
-    error_reason: str
-    fix_suggestion: str
-
-error_analyzer_agent = Agent(
-    name="ErrorAnalyzerAgent",
-    instructions=agent_config["ErrorAnalyzerAgent"],
-    output_type=ErrorAnalyzerOutput,
-    model=model
-)
-
-# 导出所有 agent 和相关类型
-__all__ = [
-    "model",
-    "GoalInterpreterOutput",
-    "goal_interpreter_agent",
-    "SubTask",
-    "TaskPlannerOutput",
-    "task_planner_agent",
-    "code_writer_agent",
-    "executor_agent",
-    "ErrorAnalyzerOutput",
-    "error_analyzer_agent"
-] 
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main()) 

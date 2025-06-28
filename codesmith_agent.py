@@ -5,24 +5,14 @@ import subprocess
 import sys
 from enum import Enum
 from typing import List
-from agents import Runner, enable_verbose_stdout_logging, set_tracing_disabled
+from agents import Agent, Runner, enable_verbose_stdout_logging
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
+from agents import set_tracing_disabled
 import logging
 import json
-# 导入agent和相关类型
-from agent import (
-    model,
-    GoalInterpreterOutput,
-    goal_interpreter_agent,
-    SubTask,
-    TaskPlannerOutput,
-    task_planner_agent,
-    code_writer_agent,
-    executor_agent,
-    ErrorAnalyzerOutput,
-    error_analyzer_agent
-)
 
 set_tracing_disabled(True)
 enable_verbose_stdout_logging()
@@ -56,19 +46,56 @@ def get_user_input():
 
 # 2. Agent Core Loop（大脑系统）
 # (1) 目标解析模块
+class GoalInterpreterOutput(BaseModel):
+    task: str
+    input: str
+    output: str
+    modules: List[str]
+    constraints: List[str]
+
+goal_interpreter_agent = Agent(
+    name="GoalInterpreterAgent",
+    instructions="解析自然语言任务，输出任务的结构化信息",
+    output_type=GoalInterpreterOutput,
+    model=model
+)
+
 async def run_goal_interpreter(input_task):
     result = await Runner.run(goal_interpreter_agent, input_task)
     return result.final_output
 
 # (2) 任务拆解模块
+class SubTask(BaseModel):
+    module: str
+    sub_goal: str
+    dependencies: List[str]
+
+class TaskPlannerOutput(BaseModel):
+    sub_tasks: List[SubTask]
+
+task_planner_agent = Agent(
+    name="TaskPlannerAgent",
+    instructions="将任务划分为明确模块，为每个模块分配子目标，管理模块之间的依赖关系",
+    output_type=TaskPlannerOutput,
+    model=model
+)
+
 async def run_task_planner(goal_info):
+    # 将输入封装成符合要求的格式
     input_list = [{"role": "user", "content": str(goal_info)}]
     result = await Runner.run(task_planner_agent, input_list)
     return result.final_output
 
 # (3) 代码生成模块
+code_writer_agent = Agent(
+    name="CodeWriterAgent",
+    instructions="使用 LLM 为每个模块生成对应 .py 文件，包含函数、注释、调用关系，保存到工作目录",
+    model=model
+)
+
 async def run_code_writer(sub_tasks, work_dir):
     for sub_task in sub_tasks:
+        # 将 SubTask 对象转换为合适的输入格式
         input_list = [{
             "role": "user",
             "content": f"模块: {getattr(sub_task, 'module', '')}\n子目标: {getattr(sub_task, 'sub_goal', '')}\n依赖: {', '.join(getattr(sub_task, 'dependencies', []))}"
@@ -81,6 +108,12 @@ async def run_code_writer(sub_tasks, work_dir):
             f.write(code)
 
 # (4) 执行与测试模块
+executor_agent = Agent(
+    name="ExecutorAgent",
+    instructions="自动执行生成的主程序或测试用例，捕获运行结果和异常，输出日志",
+    model=model
+)
+
 async def run_executor(work_dir, main_file):
     main_path = os.path.join(work_dir, main_file)
     try:
@@ -93,6 +126,18 @@ async def run_executor(work_dir, main_file):
     return output, error
 
 # (5) 错误分析模块
+class ErrorAnalyzerOutput(BaseModel):
+    error_type: str
+    error_reason: str
+    fix_suggestion: str
+
+error_analyzer_agent = Agent(
+    name="ErrorAnalyzerAgent",
+    instructions="解析错误，分类错误原因，给出结构化修复建议",
+    output_type=ErrorAnalyzerOutput,
+    model=model
+)
+
 async def run_error_analyzer(error_log):
     result = await Runner.run(error_analyzer_agent, error_log)
     return result.final_output
