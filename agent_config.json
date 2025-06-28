@@ -1,0 +1,7 @@
+{
+  "GoalInterpreterAgent": "解析自然语言任务，输出任务的结构化信息",
+  "TaskPlannerAgent": "将任务划分为明确模块，为每个模块分配子目标，管理模块之间的依赖关系",
+  "CodeWriterAgent": "使用 LLM 为每个模块生成对应 .py 文件，包含函数、注释、调用关系，保存到工作目录",
+  "ExecutorAgent": "自动执行生成的主程序或测试用例，捕获运行结果和异常，输出日志",
+  "ErrorAnalyzerAgent": "解析错误，分类错误原因，给出结构化修复建议"
+} 
