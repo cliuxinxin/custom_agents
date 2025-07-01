@@ -88,6 +88,11 @@ If the current agent has an output_type, the loop runs until the agent produces 
 If the current agent does not have an output_type, the loop runs until the current agent produces a message without any tool calls/handoffs.
 
 # openrouter agent example
+from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
+from dotenv import load_dotenv
+
+load_dotenv()
+
  配置 OpenRouter 的信息
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 openrouter_base_url = "https://openrouter.ai/api/v1"
