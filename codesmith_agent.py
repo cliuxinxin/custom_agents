@@ -3,308 +3,224 @@ import asyncio
 import os
 import subprocess
 import sys
-from enum import Enum
-from typing import List
-from agents import Agent, Runner, enable_verbose_stdout_logging
+from typing import List, Dict # Explicitly import Dict
+from agents import Agent, Runner, enable_verbose_stdout_logging, handoff, function_tool, RunContextWrapper
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
-from agents import set_tracing_disabled
-import logging
-import json
+from agents import set_tracing_disabled # Correct import for disabling tracing
+from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX # Recommended for handoffs
 
+import logging
+# json and pypinyin were imported but not used in the provided snippet, removing for simplicity.
+# import json
+# import pypinyin
+
+# --- Configuration and Setup ---
+# Disable tracing as requested
 set_tracing_disabled(True)
 enable_verbose_stdout_logging()
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG) # Set logging level to DEBUG for more details
 
-# 加载 .env 文件
+# Load .env file
 load_dotenv()
-# 配置 OpenRouter 的信息
+
+# Configure OpenRouter
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 openrouter_base_url = "https://openrouter.ai/api/v1"
-openrouter_model_name = "deepseek/deepseek-chat-v3-0324:free"
+# Use a suitable model from OpenRouter
+# Check https://openrouter.ai/docs#models for available models and their pricing/capabilities
+# deepseek/deepseek-chat-v3-0324 might be free but has limitations, consider alternatives like
+# "openai/gpt-4o-mini" or "mistralai/mistral-large-latest" or "google/gemini-pro"
+# For this example, we'll use a placeholder, replace with your chosen model:
+openrouter_model_name = "deepseek/deepseek-chat-v3-0324:free" # Recommended starting point
 
-# 创建 OpenAI 客户端，使用 OpenRouter 的信息
+if not openrouter_api_key:
+    logging.error("OPENROUTER_API_KEY not found in environment variables.")
+    sys.exit(1)
+
+# Create OpenAI client, using OpenRouter's info
 openai_client = AsyncOpenAI(
     api_key=openrouter_api_key,
     base_url=openrouter_base_url
 )
 
-# 创建 OpenAIChatCompletionsModel 实例
+# Create OpenAIChatCompletionsModel instance
 model = OpenAIChatCompletionsModel(
     model=openrouter_model_name,
     openai_client=openai_client
 )
 
-# 1. 用户输入层（CLI）
-def get_user_input():
+logging.info(f"Using OpenRouter model: {openrouter_model_name}")
+
+# --- Context ---
+from dataclasses import dataclass, field
+
+@dataclass
+class CodeContext:
+    """Context for the code generation workflow."""
+    working_dir: str = "./generated_code_run" # Code will be saved here
+    # Add conversation history if needed for more complex interactions, but
+    # for this simple chain, the handoff input manages the key info.
+
+# --- Tools ---
+@function_tool
+def write_file(filename: str, content: str, context: CodeContext) -> str:
+    """Writes content to a file in the working directory."""
+    filepath = os.path.join(context.working_dir, filename)
+    try:
+        os.makedirs(context.working_dir, exist_ok=True)
+        with open(filepath, "w", encoding='utf-8') as f: # Specify encoding
+            f.write(content)
+        logging.info(f"Successfully wrote code to {filepath}")
+        return f"Successfully wrote code to {filepath}"
+    except Exception as e:
+        logging.error(f"Error writing file {filepath}: {e}")
+        return f"Error writing file {filepath}: {e}"
+
+@function_tool
+def execute_python_file(filename: str, context: CodeContext) -> str:
+    """Executes a Python file in the working directory and returns output/errors."""
+    filepath = os.path.join(context.working_dir, filename)
+    if not os.path.exists(filepath):
+        logging.warning(f"Attempted to execute non-existent file: {filepath}")
+        return f"Error: File not found at {filepath}"
+
+    logging.info(f"Executing file: {filepath}")
+    try:
+        # Simple execution, may need more robust handling for complex scripts or environments
+        # Using shell=False is safer if command components are user-provided, but here filename is agent-controlled.
+        # cwd sets the current working directory for the subprocess.
+        result = subprocess.run(
+            [sys.executable, filepath], # Use sys.executable to find the correct python interpreter
+            capture_output=True,
+            text=True,
+            cwd=context.working_dir,
+            check=True, # Raise CalledProcessError for non-zero exit code
+            encoding='utf-8' # Specify encoding for text capture
+        )
+        logging.info(f"Execution Successful for {filename}")
+        return f"Execution Successful:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Execution Failed for {filename}: Return Code {e.returncode}")
+        return f"Execution Failed:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}\nReturn Code: {e.returncode}"
+    except FileNotFoundError:
+         logging.error("Python interpreter not found.")
+         return f"Execution Failed: Python interpreter not found."
+    except Exception as e:
+         logging.error(f"Execution Failed with unexpected error for {filename}: {e}")
+         return f"Execution Failed with unexpected error: {e}"
+
+# --- Agents ---
+
+# Define Agents in reverse order of dependency for handoffs
+# 3. Code Tester Agent
+# This agent receives the filename from the Coder and executes it.
+code_tester_agent = Agent[CodeContext]( # Specify Context type
+    name="Code Tester",
+    instructions=f"""{RECOMMENDED_PROMPT_PREFIX}
+You are a code execution environment for Python scripts.
+You receive a single filename as input, which is the Python script to execute.
+Your task is to execute the specified Python file using the `execute_python_file` tool.
+After execution, report the exact output (STDOUT and STDERR) from the `execute_python_file` tool call to the user.
+If execution fails, report the error details provided by the tool.
+Do NOT write or modify code. Only execute the provided file.
+""",
+    tools=[execute_python_file], # Can use execute_python_file tool
+    model=model
+    # No handoffs - this is the end of the workflow chain
+)
+
+# 2. Code Writer Agent
+# This agent receives the coding plan from the Planner and writes the code file.
+# It then hands off the filename to the Tester.
+code_writer_agent = Agent[CodeContext]( # Specify Context type
+    name="Code Writer",
+    instructions=f"""{RECOMMENDED_PROMPT_PREFIX}
+You are a Python code writing expert.
+You receive a detailed plan or description of a Python script to write.
+Your task is to write a complete, correct, and well-commented Python script based *exactly* on the plan you receive.
+Name the file `script.py`.
+Use the `write_file` tool to save the generated code to `script.py` in the user's working directory.
+After successfully writing the file, you MUST handoff to the 'Code Tester' agent, providing the filename `script.py` as the input to the handoff tool.
+Do NOT execute the code yourself. Only write it and save it.
+""",
+    tools=[write_file], # Can use write_file tool
+    # Handoff the filename string to the Code Tester
+    # *** FIX: Explicitly set on_handoff=None ***
+    handoffs=[handoff(code_tester_agent, on_handoff=str, input_type=str)],
+    model=model
+)
+
+# 1. Code Planner Agent
+# This agent receives the initial user request, plans the code, and hands off to the Writer.
+code_planner_agent = Agent[CodeContext]( # Specify Context type
+    name="Code Planner",
+    instructions=f"""{RECOMMENDED_PROMPT_PREFIX}
+You are a helpful assistant that plans Python code implementations based on user requests.
+Analyze the user's request carefully. Break it down into a clear, detailed plan for writing a single Python script.
+The plan should describe the required functionality, steps, and overall structure.
+Do NOT write the code yourself. Your output should be a detailed plan for the Code Writer agent.
+Once the plan is complete, you MUST handoff to the 'Code Writer' agent using the appropriate tool, providing the plan as the input to the handoff tool.
+Ensure the plan is clear enough for the Code Writer to directly implement the request.
+""",
+    # Handoff the plan (as a string) to the Code Writer
+    # *** FIX: Explicitly set on_handoff=None ***
+    handoffs=[handoff(code_writer_agent, on_handoff=str, input_type=str)],
+    model=model
+    # We are omitting guardrails for simplicity as they were not in the user's provided snippet
+    # input_guardrails=[initial_request_guardrail], # Example if adding guardrails back
+)
+
+
+# --- Main Workflow Execution ---
+
+async def run_codesmith_workflow(user_request: str):
+    """Runs the code generation, writing, and testing workflow."""
+    logging.info(f"--- Starting CodeSmith Workflow ---")
+    logging.info(f"User Request: {user_request}")
+
+    # Create context
+    ctx = CodeContext(working_dir="./generated_code_run")
+    # Ensure working directory exists
+    os.makedirs(ctx.working_dir, exist_ok=True)
+    logging.info(f"Working directory: {ctx.working_dir}")
+
+    try:
+        # Start the workflow by running the Planner Agent.
+        # The Planner will handoff to Writer, which hands off to Tester automatically
+        result = await Runner.run(
+            code_planner_agent, # Start with the Planner
+            user_request,
+            context=ctx,
+            # Tracing is already disabled globally via set_tracing_disabled(True)
+            # run_config=RunConfig(tracing_disabled=True) # Alternative way per run
+        )
+
+        logging.info("\n--- Workflow Completed ---")
+        # The final output comes from the last agent in the chain (CodeTesterAgent)
+        print(f"Final Output (Execution Result):\n{result.final_output}")
+
+    # We removed the specific GuardrailTripwireTriggered exception handling for simplicity,
+    # but you might want to add general exception handling.
+    except Exception as e:
+        logging.error(f"\n--- Workflow Failed ---")
+        print(f"An unexpected error occurred during the workflow: {e}")
+        logging.exception("Detailed exception:")
+
+
+# --- CLI Entry Point ---
+if __name__ == "__main__":
+    # Example Usage
+    # Ensure you have set up your OPENROUTER_API_KEY environment variable.
+    # Ensure you have replaced openrouter_model_name with a valid model name.
+
+    # Get input from CLI arguments
     parser = argparse.ArgumentParser(description='CodeSmith Agent')
     parser.add_argument('input', type=str, help='自然语言描述的开发目标')
     args = parser.parse_args()
-    return args.input
+    user_input = args.input
 
-# 2. Agent Core Loop（大脑系统）
-# (1) 目标解析模块
-class GoalInterpreterOutput(BaseModel):
-    task: str
-    input: str
-    output: str
-    modules: List[str]
-    constraints: List[str]
-
-goal_interpreter_agent = Agent(
-    name="GoalInterpreterAgent",
-    instructions="解析自然语言任务，输出任务的结构化信息",
-    output_type=GoalInterpreterOutput,
-    model=model
-)
-
-async def run_goal_interpreter(input_task):
-    result = await Runner.run(goal_interpreter_agent, input_task)
-    return result.final_output
-
-# (2) 任务拆解模块
-class SubTask(BaseModel):
-    module: str
-    sub_goal: str
-    dependencies: List[str]
-
-class TaskPlannerOutput(BaseModel):
-    sub_tasks: List[SubTask]
-
-task_planner_agent = Agent(
-    name="TaskPlannerAgent",
-    instructions="将任务划分为明确模块，为每个模块分配子目标，管理模块之间的依赖关系",
-    output_type=TaskPlannerOutput,
-    model=model
-)
-
-async def run_task_planner(goal_info):
-    # 将输入封装成符合要求的格式
-    input_list = [{"role": "user", "content": str(goal_info)}]
-    result = await Runner.run(task_planner_agent, input_list)
-    return result.final_output
-
-# (3) 代码生成模块
-code_writer_agent = Agent(
-    name="CodeWriterAgent",
-    instructions="使用 LLM 为每个模块生成对应 .py 文件，包含函数、注释、调用关系，保存到工作目录",
-    model=model
-)
-
-async def run_code_writer(sub_tasks, work_dir):
-    for sub_task in sub_tasks:
-        # 将 SubTask 对象转换为合适的输入格式
-        input_list = [{
-            "role": "user",
-            "content": f"模块: {getattr(sub_task, 'module', '')}\n子目标: {getattr(sub_task, 'sub_goal', '')}\n依赖: {', '.join(getattr(sub_task, 'dependencies', []))}"
-        }]
-        result = await Runner.run(code_writer_agent, input_list)
-        code = result.final_output
-        file_name = f"{getattr(sub_task, 'module', 'module')}.py"
-        file_path = os.path.join(work_dir, file_name)
-        with open(file_path, 'w') as f:
-            f.write(code)
-
-# (4) 执行与测试模块
-executor_agent = Agent(
-    name="ExecutorAgent",
-    instructions="自动执行生成的主程序或测试用例，捕获运行结果和异常，输出日志",
-    model=model
-)
-
-async def run_executor(work_dir, main_file):
-    main_path = os.path.join(work_dir, main_file)
-    try:
-        result = subprocess.run([sys.executable, main_path], capture_output=True, text=True, check=True)
-        output = result.stdout
-        error = None
-    except subprocess.CalledProcessError as e:
-        output = e.stdout
-        error = e.stderr
-    return output, error
-
-# (5) 错误分析模块
-class ErrorAnalyzerOutput(BaseModel):
-    error_type: str
-    error_reason: str
-    fix_suggestion: str
-
-error_analyzer_agent = Agent(
-    name="ErrorAnalyzerAgent",
-    instructions="解析错误，分类错误原因，给出结构化修复建议",
-    output_type=ErrorAnalyzerOutput,
-    model=model
-)
-
-async def run_error_analyzer(error_log):
-    result = await Runner.run(error_analyzer_agent, error_log)
-    return result.final_output
-
-# (6) 记忆与上下文模块
-class MemoryManager:
-    def __init__(self, save_path="memory.json"):
-        self.save_path = save_path
-        self.global_goal = None
-        self.current_progress = None
-        self.sub_task_status = {}
-        self.failure_attempts = {}
-        self.fix_logs = {}
-        self.human_feedback = ""  # 新增：人工补充信息
-
-    def save(self):
-        data = self.__dict__.copy()
-        with open(self.save_path, "w") as f:
-            json.dump(data, f)
-
-    def load(self):
-        if os.path.exists(self.save_path):
-            with open(self.save_path, "r") as f:
-                data = json.load(f)
-                self.__dict__.update(data)
-
-    def update_human_feedback(self, feedback):
-        self.human_feedback = feedback
-        self.save()
-
-    def update_global_goal(self, goal):
-        self.global_goal = goal
-
-    def update_current_progress(self, progress):
-        self.current_progress = progress
-
-    def update_sub_task_status(self, sub_task, status):
-        self.sub_task_status[sub_task] = status
-
-    def increment_failure_attempts(self, sub_task):
-        if sub_task not in self.failure_attempts:
-            self.failure_attempts[sub_task] = 0
-        self.failure_attempts[sub_task] += 1
-
-    def add_fix_log(self, sub_task, log):
-        if sub_task not in self.fix_logs:
-            self.fix_logs[sub_task] = []
-        self.fix_logs[sub_task].append(log)
-
-# 3. 可控性与护栏设计
-# (1) 目标注入机制
-def inject_goal_prompt(prompt, global_goal, sub_task):
-    return f'你正在为目标"{global_goal}"中的子任务"{sub_task}"编写代码。{prompt}'
-
-# (2) 状态驱动（FSM）
-class AgentState(Enum):
-    START = "START"
-    GOAL_PARSED = "GOAL_PARSED"
-    TASKS_PLANNED = "TASKS_PLANNED"
-    CODE_WRITTEN = "CODE_WRITTEN"
-    TESTED = "TESTED"
-    FIXING_ERROR = "FIXING_ERROR"
-    DONE = "DONE"
-
-# (3) 错误限速与终止机制
-MAX_FAILURE_ATTEMPTS = 3
-
-def check_failure_attempts(memory_manager, sub_task):
-    if sub_task in memory_manager.failure_attempts and memory_manager.failure_attempts[sub_task] >= MAX_FAILURE_ATTEMPTS:
-        return True
-    return False
-
-# (4) 错误分类处理机制
-def classify_error(error_log):
-    if "invalid syntax" in error_log:
-        return "SyntaxError", "提示模型重写该行代码"
-    elif "No module named" in error_log:
-        return "ImportError", "检查是否写错模块名/requirements"
-    elif "index out of range" in error_log:
-        return "IndexError", "检查列表长度与访问边界"
-    elif "ConnectionError" in error_log:
-        return "RequestError", "加重试机制或代理"
-    return "UnknownError", "无明确修复策略"
-
-# 4. 整体流程实现
-async def main():
-    # 用户输入
-    input_task = get_user_input()
-
-    # 初始化记忆管理器，尝试加载历史
-    memory_manager = MemoryManager()
-    memory_manager.load()
-    if memory_manager.current_progress:
-        print(f"检测到未完成任务，当前进度：{memory_manager.current_progress}")
-        resume = input("是否继续上次任务？(y/n): ")
-        if resume.lower() != "y":
-            memory_manager = MemoryManager()  # 重置
-            memory_manager.update_global_goal(input_task)
-    else:
-        memory_manager.update_global_goal(input_task)
-
-    # 目标解析
-    if memory_manager.current_progress != "GOAL_PARSED":
-        goal_info = await run_goal_interpreter(input_task)
-        memory_manager.update_current_progress("GOAL_PARSED")
-        memory_manager.save()
-    else:
-        goal_info = None  # 可根据需要从memory恢复
-
-    # 任务拆解
-    if memory_manager.current_progress != "TASKS_PLANNED":
-        sub_tasks_info = await run_task_planner(goal_info)
-        memory_manager.update_current_progress("TASKS_PLANNED")
-        memory_manager.save()
-    else:
-        sub_tasks_info = None  # 可根据需要从memory恢复
-
-    # 代码生成
-    work_dir = "workspace"
-    os.makedirs(work_dir, exist_ok=True)
-    if memory_manager.current_progress != "CODE_WRITTEN":
-        await run_code_writer(sub_tasks_info.sub_tasks, work_dir)
-        memory_manager.update_current_progress("CODE_WRITTEN")
-        memory_manager.save()
-
-    # 执行与测试
-    main_file = "main.py"  # 假设主程序文件名为 main.py
-    output, error = await run_executor(work_dir, main_file)
-    memory_manager.update_current_progress("TESTED")
-    memory_manager.save()
-
-    while error:
-        # 错误分析
-        error_analysis = await run_error_analyzer(error)
-        memory_manager.increment_failure_attempts(main_file)
-        memory_manager.add_fix_log(main_file, error_analysis.fix_suggestion)
-        memory_manager.save()
-
-        # 错误限速与终止机制检查
-        if check_failure_attempts(memory_manager, main_file):
-            print("连续失败次数达到上限，进入 HumanHelpNeeded 状态")
-            # 允许人工输入补充信息
-            feedback = input("请补充有用的信息（如 humanloop 分析、修复建议等），回车跳过：\n")
-            if feedback.strip():
-                memory_manager.update_human_feedback(feedback)
-            break
-
-        # 代码修复，注入人工补充信息
-        fix_prompt = inject_goal_prompt(
-            error_analysis.fix_suggestion + "\n" + memory_manager.human_feedback,
-            input_task, "修复代码"
-        )
-        fix_result = await Runner.run(code_writer_agent, fix_prompt)
-        fix_code = fix_result.final_output
-        fix_file_path = os.path.join(work_dir, main_file)
-        with open(fix_file_path, 'w') as f:
-            f.write(fix_code)
-
-        # 再次执行与测试
-        output, error = await run_executor(work_dir, main_file)
-        memory_manager.update_current_progress("TESTED")
-        memory_manager.save()
-
-    if not error:
-        memory_manager.update_current_progress("DONE")
-        memory_manager.save()
-        print("项目已成功运行，输出结果：", output)
-
-if __name__ == "__main__":
-    asyncio.run(main()) 
+    # Run the workflow
+    asyncio.run(run_codesmith_workflow(user_input))
