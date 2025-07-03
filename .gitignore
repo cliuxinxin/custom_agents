@@ -197,3 +197,5 @@ agent_plan.md
 plan_output.json
 .gitignore
 run_log.md
+execute_log.md
+execution_state.json
