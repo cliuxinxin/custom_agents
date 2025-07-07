@@ -199,3 +199,5 @@ plan_output.json
 run_log.md
 execute_log.md
 execution_state.json
+workspace/plan_state.json
+workspace/multi_agent_log.md

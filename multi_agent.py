@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Literal
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -132,7 +132,7 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'agent_config.json')
 with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
     agent_config = json.load(f)
 
-# ========== openai模型配置 ==========
+# ========== deepseek模型配置 ==========
 set_tracing_disabled(True)
 enable_verbose_stdout_logging()
 load_dotenv()
@@ -146,13 +146,11 @@ model = OpenAIChatCompletionsModel(
     openai_client=openai_client
 )
 
-# ========== schema ==========
-# 只用于计划生成
+# ========== Agent schema ==========
 class PlanStep(BaseModel):
     step_number: int
     task_description: str
     expected_output: str
-    milestone: str
 
 class PlanOutput(BaseModel):
     steps: List[PlanStep]
@@ -164,22 +162,31 @@ class ExecuteOutput(BaseModel):
 class JudgeOutput(BaseModel):
     passed: bool
     reason: str = ""
-    problem: str = ""
+    problem: Literal["plan", "execute"]
     suggestion: str = ""
 
-# 只用于执行记录
-class StepState(BaseModel):
-    status: str = "pending"  # pending, passed, failed
-    exec_result: Any = None
-    judge_result: Any = None
-    retry: int = 0
+# ========== Step schema ==========
+class StepTry(BaseModel):
+    step_number: int
     human_hint: str = ""
+    current_try: int = 0
+    exec_input: dict = {}
+    exec_result: dict = {}
+    judge_result: dict = {}
+
+class StepState(BaseModel):
+    status: str = "pending"  # pending/passed/failed
+    tries: list = []  # List[StepTry]
+    current_try: int = 0
+    target: str = ""
+    current_step: int = 0
 
 class PlanState(BaseModel):
     target: str
-    plan_steps: List[PlanStep]  # 静态计划内容
-    step_states: List[StepState]  # 动态执行状态
     current_step: int = 0
+    current_try: int = 0
+    plan_steps: List[PlanStep]  # 静态计划内容
+    try_status: List[StepState]  # 动态执行状态
     human_hint: str = ""
 
 # ========== agent实例 ==========
@@ -213,8 +220,25 @@ def load_plan_state() -> PlanState:
         return None
     with open(PLAN_STATE_PATH, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    steps = [PlanStep(**step) for step in data['steps']]
-    return PlanState(target=data['target'], steps=steps, current_step=data.get('current_step', 0), human_hint=data.get('human_hint', ""))
+    plan_steps = [PlanStep(**step) for step in data['plan_steps']]
+    step_states = []
+    for s in data['try_status']:
+        tries = [StepTry(**t) for t in s.get('tries',[])]
+        step_states.append(StepState(
+            status=s.get('status', 'pending'),
+            tries=tries,
+            current_try=s.get('current_try', 0),
+            target=s.get('target', ''),
+            current_step=s.get('current_step', 0)
+        ))
+    return PlanState(
+        target=data['target'],
+        plan_steps=plan_steps,
+        try_status=step_states,
+        current_step=data.get('current_step', 0),
+        current_try=data.get('current_try', 0),
+        human_hint=data.get('human_hint', "")
+    )
 
 def write_log(content: str):
     with open(LOG_PATH, 'a', encoding='utf-8') as f:
@@ -231,14 +255,13 @@ async def main():
         # 首次运行，生成计划
         target = "通过读取https://github.com/openai/openai-agents-python的代码，了解这个库怎么用，输出一个报告方便人类阅读"
         plan_input = {
-            "human_instruction": "",
-            "agent_self_hint": "",
             "agent_target": target
         }
         plan_result = await Runner.run(plan_agent, input=json.dumps(plan_input, ensure_ascii=False))
         plan_steps = list(plan_result.final_output.steps)  # List[PlanStep]
-        step_states = [StepState() for _ in plan_steps]
-        plan_state = PlanState(target=target, plan_steps=plan_steps, step_states=step_states)
+        # 初始化每个StepState时补充目标、全部计划、当前步骤编号
+        step_states = [StepState(target=target, current_step=i, tries=[]) for i in range(len(plan_steps))]
+        plan_state = PlanState(target=target, plan_steps=plan_steps, try_status=step_states)
         save_plan_state(plan_state)
         reset_log()
         write_log(f"# 目标: {target}\n")
@@ -249,49 +272,61 @@ async def main():
     while plan_state.current_step < len(plan_state.plan_steps):
         step_idx = plan_state.current_step
         plan_step = plan_state.plan_steps[step_idx]  # 静态计划内容
-        step_state = plan_state.step_states[step_idx]  # 动态执行状态
+        step_state = plan_state.try_status[step_idx]  # 动态执行状态
+        # 同步更新step_state的current_step、target
+        step_state.current_step = step_idx
+        step_state.target = plan_state.target
         if step_state.status == "passed":
             plan_state.current_step += 1
             continue
 
-        retry_count = step_state.retry
+        retry_count = step_state.current_try
         while retry_count < 3:
             write_log(f"\n## 步骤 {plan_step.step_number} 第{retry_count+1}次尝试\n- 任务: {plan_step.task_description}")
             # 执行
             exec_input = {
                 "step": plan_step.model_dump(),
-                "state": step_state.model_dump(),
-                "plan": plan_state.model_dump(),
-                "human_hint": step_state.human_hint or plan_state.human_hint
+                "state": {
+                    "current_step": step_state.current_step,
+                    "status": step_state.status,
+                    "current_try": step_state.current_try
+                },
+                "human_hint": step_state.tries[-1].human_hint if step_state.tries else plan_state.human_hint
             }
             exec_result = await Runner.run(execute_agent, input=json.dumps(exec_input, ensure_ascii=False))
-            step_state.exec_result = exec_result.final_output
-            write_log(f"- 执行输出: {exec_result.final_output}")
-
             # 评审
             judge_input = {
                 "step": plan_step.model_dump(),
-                "state": step_state.model_dump(),
-                "exec_result": exec_result.final_output.model_dump() if hasattr(exec_result.final_output, "model_dump") else exec_result.final_output,
-                "plan": plan_state.model_dump()
+                "state": {
+                    "current_step": step_state.current_step,
+                    "status": step_state.status,
+                    "current_try": step_state.current_try
+                },
+                "exec_result": exec_result.final_output.model_dump() if hasattr(exec_result.final_output, "model_dump") else exec_result.final_output
             }
             judge_result = await Runner.run(judge_agent, input=json.dumps(judge_input, ensure_ascii=False))
-            step_state.judge_result = judge_result.final_output
+            # 记录本次尝试
+            step_try = StepTry(
+                step_number=plan_step.step_number,
+                exec_input=exec_input,
+                exec_result=exec_result.final_output.model_dump() if hasattr(exec_result.final_output, "model_dump") else exec_result.final_output,
+                judge_result=judge_result.final_output.model_dump() if hasattr(judge_result.final_output, "model_dump") else judge_result.final_output,
+                current_try=retry_count+1,
+                human_hint=step_state.tries[-1].human_hint if step_state.tries else plan_state.human_hint
+            )
+            step_state.tries.append(step_try)
+            step_state.current_try = retry_count + 1
+            write_log(f"- 执行输出: {exec_result.final_output}")
             write_log(f"- 评审输出: {judge_result.final_output}")
-
             # 判断
             if judge_result.final_output.passed:
                 step_state.status = "passed"
                 write_log("- 结果: 通过\n")
                 plan_state.current_step += 1
-                step_state.retry = retry_count + 1
                 save_plan_state(plan_state)
                 break
             else:
-                retry_count += 1
-                step_state.retry = retry_count
                 write_log(f"- 未通过: {judge_result.final_output.reason}")
-                # 判断问题环节
                 problem = judge_result.final_output.problem
                 suggestion = judge_result.final_output.suggestion
                 if problem == "plan":
@@ -304,30 +339,41 @@ async def main():
                     }
                     plan_result = await Runner.run(plan_agent, input=json.dumps(plan_input, ensure_ascii=False))
                     new_plan_steps = list(plan_result.final_output.steps)
-                    # 只更新未通过部分
-                    for i, s in enumerate(plan_state.plan_steps):
-                        if plan_state.step_states[i].status == "passed":
-                            continue
-                        if i < len(new_plan_steps):
-                            plan_state.plan_steps[i] = new_plan_steps[i]
+                    new_step_states = []
+                    for i, new_step in enumerate(new_plan_steps):
+                        if i < len(plan_state.try_status) and plan_state.try_status[i].status == "passed":
+                            # 已通过的步骤保留原状态
+                            new_step_states.append(plan_state.try_status[i])
+                        else:
+                            # 新建未通过的步骤状态
+                            new_step_states.append(StepState(
+                                status="pending",
+                                tries=[],
+                                current_try=0,
+                                target=plan_state.target,
+                                current_step=i
+                            ))
+                    plan_state.plan_steps = new_plan_steps
+                    plan_state.try_status = new_step_states
                     save_plan_state(plan_state)
                     write_log("- 计划已更新，继续执行\n")
                     break
                 else:
                     # 执行问题，采纳建议重试
-                    step_state.human_hint = suggestion
+                    step_try.human_hint = suggestion
                     save_plan_state(plan_state)
-                    if retry_count >= 3:
+                    if retry_count >= 2:
                         write_log("- 已达最大重试次数，等待人工输入\n")
                         print(f"[中断] 步骤{plan_step.step_number}连续失败3次，请输入人类意见后回车继续：")
                         human_hint = input("请输入人类意见：")
-                        step_state.human_hint = human_hint
+                        step_try.human_hint = human_hint
                         plan_state.human_hint = human_hint
-                        step_state.retry = 0
+                        step_state.current_try = 0
                         save_plan_state(plan_state)
-                        retry_count = 0  # 重置重试次数
+                        retry_count = 0
+                    else:
+                        retry_count += 1
         else:
-            # 3次都失败，人工介入
             print(f"[中断] 步骤{plan_step.step_number}连续失败3次，已暂停。请修改plan_state.json或输入人类意见后重试。")
             break
 
