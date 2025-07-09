@@ -168,11 +168,13 @@ class JudgeOutput(BaseModel):
 # ========== Step schema ==========
 class StepTry(BaseModel):
     step_number: int
+    status : str = ""
     human_hint: str = ""
     current_try: int = 0
-    exec_input: dict = {}
-    exec_result: dict = {}
-    judge_result: dict = {}
+    exec_input: Any = {}
+    exec_result: Any = {}
+    judge_result: Any = {}
+    function_outputs: list = []  # 新增字段
 
 class StepState(BaseModel):
     status: str = "pending"  # pending/passed/failed
